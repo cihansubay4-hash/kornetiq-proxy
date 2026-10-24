@@ -1,0 +1,13 @@
+{
+  "name": "kornetiq-proxy",
+  "version": "1.0.0",
+  "description": "SIM800C Supabase IoT Bridge",
+  "main": "sunucu.js",
+  "scripts": {
+    "start": "node sunucu.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-client": "^2.45.0",
+    "express": "^4.19.2"
+  }
+}
