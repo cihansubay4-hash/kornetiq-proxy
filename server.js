@@ -2,24 +2,26 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-
 app.disable('x-powered-by');
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
-// Bu bilgiler Render → Environment bölümünden okunur.
+// Render → Environment bölümünden okunur.
 const {
   SUPABASE_URL,
   SUPABASE_KEY,
   DEVICE_TOKEN
 } = process.env;
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !DEVICE_TOKEN) {
-  console.error(
-    'Eksik ayar: Render Environment bölümünde ' +
-    'SUPABASE_URL, SUPABASE_KEY ve DEVICE_TOKEN gerekli.'
-  );
-  process.exit(1);
+for (const [name, value] of Object.entries({
+  SUPABASE_URL,
+  SUPABASE_KEY,
+  DEVICE_TOKEN
+})) {
+  if (!value) {
+    console.error(`Eksik ortam değişkeni: ${name}`);
+    process.exit(1);
+  }
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
@@ -29,7 +31,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   }
 });
 
-// Tarayıcıdan sunucunun çalışmasını kontrol etmek için.
+// Bu adresler sunucunun çalıştığını gösterir.
 app.get('/', (req, res) => {
   res.status(200).send('KORNETIQ ara sunucu çalışıyor.');
 });
@@ -38,58 +40,169 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-// Cihaz verilerini kabul eden adres.
+// Gönderilmeyen isteğe bağlı ölçümler null olur.
+function sayi(value, name, min, max, integer = false) {
+  if (
+    value === undefined ||
+    value === null ||
+    (typeof value === 'string' && value.trim() === '')
+  ) {
+    return null;
+  }
+
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    throw new Error(`${name}: sayisal deger gerekli`);
+  }
+
+  const result = Number(value);
+
+  if (
+    !Number.isFinite(result) ||
+    (integer && !Number.isInteger(result)) ||
+    result < min ||
+    result > max
+  ) {
+    throw new Error(`${name}: gecersiz deger`);
+  }
+
+  return result;
+}
+
+function gpsDurumu(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  if ([true, 1, '1', 'true'].includes(value)) return true;
+  if ([false, 0, '0', 'false'].includes(value)) return false;
+
+  throw new Error('gps_durumu: true, false, 1 veya 0 olmali');
+}
+
 app.post('/veri-gonder', async (req, res) => {
-  // Cihaz aynı şifreyi x-device-token başlığında göndermeli.
+  // Arduino aynı DEVICE_TOKEN değerini bu başlıkta göndermeli.
   if (req.get('x-device-token') !== DEVICE_TOKEN) {
     return res.status(401).send('Yetkisiz cihaz');
   }
 
-  const {
-    cihaz_id,
-    nabiz,
-    batarya,
-    baret_durumu,
-    gps_durumu
-  } = req.body || {};
+  const body = req.body || {};
+  let kayit;
 
-  if (
-    cihaz_id === undefined ||
-    cihaz_id === null ||
-    String(cihaz_id).trim() === ''
-  ) {
-    return res.status(400).send('cihaz_id gerekli');
-  }
+  try {
+    if (
+      typeof body.cihaz_id !== 'string' ||
+      !body.cihaz_id.trim()
+    ) {
+      throw new Error('cihaz_id gerekli');
+    }
 
-  const sensorVerileri = [
-    nabiz,
-    batarya,
-    baret_durumu,
-    gps_durumu
-  ];
+    const nabiz = sayi(
+      body.nabiz,
+      'nabiz',
+      0,
+      2147483647,
+      true
+    );
 
-  if (sensorVerileri.some(value => value === undefined || value === null)) {
-    return res.status(400).send('Eksik sensor verisi');
+    if (nabiz === null) {
+      throw new Error('nabiz gerekli; algilanmiyorsa 0 gonderin');
+    }
+
+    const cameraStatus = body.camera_status ?? null;
+
+    if (
+      cameraStatus !== null &&
+      typeof cameraStatus !== 'string'
+    ) {
+      throw new Error('camera_status metin olmali');
+    }
+
+    kayit = {
+      helmet_id: body.cihaz_id.trim(),
+      heart_rate: nabiz,
+      battery_level: sayi(body.batarya, 'batarya', 0, 100, true),
+      is_gps_active: gpsDurumu(body.gps_durumu),
+      latitude: sayi(body.latitude, 'latitude', -90, 90),
+      longitude: sayi(body.longitude, 'longitude', -180, 180),
+      camera_status: cameraStatus
+    };
+  } catch (err) {
+    return res.status(400).send(err.message);
   }
 
   try {
-    const { error } = await supabase
-      .from('sensor_logs')
-      .insert([{
-        cihaz_id,
-        nabiz,
-        batarya,
-        baret: baret_durumu,
-        gps: gps_durumu
-      }]);
+    // Cihazın mevcut baret kaydını bul.
+    const { data: helmet, error: lookupError } = await supabase
+      .from('helmets')
+      .select('id')
+      .eq('helmet_id', kayit.helmet_id)
+      .maybeSingle();
 
-    if (error) {
-      console.error(
-        'Supabase kayıt hatası:',
-        error.code,
-        error.message
+    if (lookupError) {
+      console.error('Baret sorgu hatası:', lookupError.message);
+      return res.status(500).send('Baret sorgulanamadi');
+    }
+
+    if (!helmet) {
+      return res.status(404).send(
+        'Bu cihaz_id ile kayitli baret yok'
       );
+    }
+
+    // Ölçümü geçmiş kayıtlarına ekle.
+    const { error: logError } = await supabase
+      .from('telemetry_logs')
+      .insert([kayit]);
+
+    if (logError) {
+      console.error('Veri kayıt hatası:', logError.message);
       return res.status(500).send('Veri kaydedilemedi');
+    }
+
+    const simdi = new Date().toISOString();
+
+    // Aktiflik yalnızca nabza bağlıdır.
+    const guncelleme = {
+      bpm: kayit.heart_rate,
+      helmet_on: kayit.heart_rate > 0,
+      online: true,
+      last_seen: simdi,
+      updated_at: simdi
+    };
+
+    // Gönderilmeyen diğer bilgiler mevcut değeri değiştirmez.
+    if (kayit.battery_level !== null) {
+      guncelleme.battery = kayit.battery_level;
+    }
+
+    if (kayit.is_gps_active !== null) {
+      guncelleme.gps = kayit.is_gps_active;
+    }
+
+    if (kayit.latitude !== null) {
+      guncelleme.latitude = kayit.latitude;
+    }
+
+    if (kayit.longitude !== null) {
+      guncelleme.longitude = kayit.longitude;
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('helmets')
+      .update(guncelleme)
+      .eq('id', helmet.id)
+      .select('id')
+      .maybeSingle();
+
+    if (updateError || !updated) {
+      console.error(
+        'Baret güncelleme hatası:',
+        updateError?.message || 'Baret bulunamadı'
+      );
+
+      return res.status(500).send(
+        'Olcum kaydedildi ancak baret durumu guncellenemedi'
+      );
     }
 
     return res.status(200).send('OK');
