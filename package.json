@@ -1,9 +1,9 @@
 {
   "name": "kornetiq-proxy",
   "version": "1.0.0",
-  "main": "sunucu.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node sunucu.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@supabase/supabase-client": "^2.45.0",
